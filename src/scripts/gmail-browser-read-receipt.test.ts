@@ -40,6 +40,27 @@ describe("Gmail query derivation (hash-nav regression)", () => {
   });
 });
 
+// Regression for the sep15 empty-DOM render race: a transient not-rendered inbox
+// (0 rows AND no range chrome — the real 19:00/19:30 shape) must be its own retryable
+// "mailbox not rendered" failure, NOT conflated with a genuine pagination overflow.
+// A real overflow ("1–50 de 1,048", 49 rendered) stays "pagination incomplete".
+// Reverting the split re-collapses both into the pagination error (fails-before).
+describe("Gmail empty-DOM vs pagination classification (sep15 render-race regression)", () => {
+  const throwMsg = (inbox: unknown) => {
+    try { validateInbox(inbox as never); return null; }
+    catch (error) { return (error as Error).message; }
+  };
+  it("classifies an empty-DOM race as a retryable not-rendered failure", () => {
+    const msg = throwMsg({ authenticated: true, query: "newer_than:2d in:inbox", range: undefined, rows: [] });
+    expect(msg).toMatch(/^mailbox not rendered/);
+  });
+  it("keeps a real pagination overflow (with thousands separator) as pagination incomplete", () => {
+    const overflow = { authenticated: true, query: "newer_than:2d in:inbox", range: "1–50 de 1,048",
+      rows: new Array(49).fill(0).map((_, i) => ({ subject: "s" + i, sender: "x", date: "d", threadId: "a" + i, messageId: "b" + i })) };
+    expect(throwMsg(overflow)).toBe("mailbox pagination incomplete or unsupported");
+  });
+});
+
 describe("Gmail browser read receipt", () => {
   it.each(["authentication", "pagination", "identity"])("fails closed on incomplete %s", (boundary) => {
     const inbox = makeInbox();

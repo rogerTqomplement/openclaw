@@ -13,7 +13,14 @@ export function validateInbox(inbox) {
   if (!inbox.authenticated || inbox.query?.trim() !== query || !Array.isArray(inbox.rows)) {
     throw new Error("mailbox authentication/query not verified");
   }
-  const range = inbox.range?.replace(/\s/g, "").match(/^1[–-](\d+)(?:de|of)(\d+)$/);
+  // A transient empty-DOM render race (list frame never painted: 0 rows AND no range
+  // chrome) is retryable and must NOT be conflated with a genuine pagination overflow;
+  // conflating them made the sep15 19:00/19:30 empty loads look like an unrecoverable
+  // pagination fault. Also strip thousands separators ("1–50 de 1,048").
+  if (inbox.rows.length === 0 && (!inbox.range || String(inbox.range).trim() === "")) {
+    throw new Error("mailbox not rendered (empty DOM; retryable)");
+  }
+  const range = inbox.range?.replace(/\s/g, "").replace(/,/g, "").match(/^1[–-](\d+)(?:de|of)(\d+)$/);
   if (!range || Number(range[1]) !== inbox.rows.length || Number(range[2]) !== inbox.rows.length) {
     throw new Error("mailbox pagination incomplete or unsupported");
   }
@@ -68,8 +75,19 @@ export function runMailboxCheck({ artifactDir, dedupePath, browserCall = browser
     return response.result;
   };
   try {
-    const inbox = evaluate(inboxFn);
-    const inboxHash = validateInbox(inbox);
+    // Retry the initial read on a transient empty-DOM render race: the list frame
+    // occasionally has not painted on first evaluate, which previously aborted the
+    // whole scheduled run. A real pagination overflow or auth failure still fails fast.
+    let inbox;
+    let inboxHash;
+    for (let attempt = 0; ; attempt++) {
+      inbox = evaluate(inboxFn);
+      try { inboxHash = validateInbox(inbox); break; }
+      catch (error) {
+        if (attempt < 4 && String(error?.message || "").startsWith("mailbox not rendered")) continue;
+        throw error;
+      }
+    }
     writePrivate(path.join(artifactDir, "inbox.json"), inbox);
     const entries = [];
     for (const [index, row] of inbox.rows.entries()) {
