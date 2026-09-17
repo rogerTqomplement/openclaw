@@ -64,6 +64,62 @@ describe("Gmail empty-DOM vs pagination classification (sep15 render-race regres
   });
 });
 
+// Receipt-isolation regression (sep17 receipt-isolation-review-sep17-1446): the mocked test
+// suite must NEVER write the real canonical receipt the scheduled reader owns. The prior
+// consolidated suite called runMailboxCheck WITHOUT receiptStatePath, so the helper defaulted
+// to DEFAULT_RECEIPT_STATE_PATH (~/rocky-pipeline/state/gmail-watch-last-check.json) and the
+// "complete" path's writeCanonical() overwrote the real file with a test tmp artifactDir
+// (observed live: artifactDir=.../tmp/gmail-receipt-test-cQRKQV/proof). This test proves that
+// a mocked complete run AND a mocked failed run, when given an explicit private receiptStatePath,
+// write ONLY that private file and leave the real canonical default path untouched.
+describe("receipt isolation: mocked checks never touch the canonical default receipt", () => {
+  // Resolve the SAME default the helper captured at import (HOME-derived), read-only.
+  const canonicalDefault = path.join(process.env.HOME ?? "/Users/rogelio", "rocky-pipeline", "state", "gmail-watch-last-check.json");
+  const snapshot = () => (fs.existsSync(canonicalDefault)
+    ? { exists: true, bytes: fs.readFileSync(canonicalDefault) }
+    : { exists: false, bytes: Buffer.alloc(0) });
+
+  const makeInboxRow = () => ({ ok: true, result: makeInbox() });
+  const makeThread = (body: string) => ({ ok: true, result: { subject: "Example", messageId: "def456", body } });
+
+  it.each(["complete", "missing-body"])("writes only the private receiptStatePath on a %s mocked run", (outcome) => {
+    const before = snapshot();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-receipt-isolation-"));
+    roots.push(root);
+    const dedupePath = path.join(root, "seen.txt");
+    fs.writeFileSync(dedupePath, "existing notification key\n");
+    const artifactDir = path.join(root, "proof");
+    const receiptStatePath = path.join(root, "private-receipt-state.json");
+    let reads = 0;
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return { suggestedTargetId: "iso-tab" };
+      if (args[0] !== "evaluate") return { ok: true };
+      reads++;
+      if (reads === 2) return makeThread(outcome === "missing-body" ? "" : "Latest message content");
+      return makeInboxRow();
+    });
+
+    if (outcome === "complete") {
+      const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath });
+      expect(receipt).toMatchObject({ complete: true });
+      // The private receipt IS written, and it records the private artifactDir (not canonical).
+      expect(fs.existsSync(receiptStatePath)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(receiptStatePath, "utf8"))).toMatchObject({ artifactDir });
+    } else {
+      expect(() => runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath })).toThrow();
+      // A failed run writes NO receipt at all (fails closed) — neither private nor canonical.
+      expect(fs.existsSync(receiptStatePath)).toBe(false);
+    }
+
+    // The real canonical default receipt is byte-for-byte unchanged (or still absent).
+    const after = snapshot();
+    expect(after.exists).toBe(before.exists);
+    expect(after.bytes.equals(before.bytes)).toBe(true);
+    // Defensive: the mocked run must never have targeted the canonical default path.
+    expect(receiptStatePath).not.toBe(canonicalDefault);
+  });
+});
+
 describe("Gmail browser read receipt", () => {
   it.each(["authentication", "pagination", "identity"])("fails closed on incomplete %s", (boundary) => {
     const inbox = makeInbox();
@@ -79,6 +135,9 @@ describe("Gmail browser read receipt", () => {
     const dedupePath = path.join(root, "seen.txt");
     fs.writeFileSync(dedupePath, "existing notification key\n");
     const artifactDir = path.join(root, "proof");
+    // Isolation: mocked checks must write their receipt to a PRIVATE per-test path,
+    // never the canonical DEFAULT_RECEIPT_STATE_PATH the scheduled reader owns.
+    const receiptStatePath = path.join(root, "receipt-state.json");
     let reads = 0;
     const browserCall = vi.fn((args: string[]) => {
       if (args[0] === "open") return { suggestedTargetId: "test-tab" };
@@ -88,11 +147,11 @@ describe("Gmail browser read receipt", () => {
       return { ok: true, result: makeInbox() };
     });
     if (outcome === "complete") {
-      const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall });
+      const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath });
       expect(receipt).toMatchObject({ complete: true, checkedCount: 1, readKeys: ["abc123:def456"], sentMail: false, sentMessages: false, notificationDedupeAdvanced: false });
       expect(fs.existsSync(path.join(artifactDir, "receipt.json"))).toBe(true);
     } else {
-      expect(() => runMailboxCheck({ artifactDir, dedupePath, browserCall })).toThrow();
+      expect(() => runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath })).toThrow();
       expect(fs.existsSync(path.join(artifactDir, "receipt.json"))).toBe(false);
     }
     expect(fs.readFileSync(dedupePath, "utf8")).toBe("existing notification key\n");
@@ -165,6 +224,7 @@ describe("back-to-back helper runs survive an empty open on the second run", () 
     roots.push(root);
     const dedupePath = path.join(root, "seen.txt");
     fs.writeFileSync(dedupePath, "existing notification key\n");
+    const receiptStatePath = path.join(root, "receipt-state.json");
 
     let runIndex = 0;
     const makeBrowserCall = () => {
@@ -190,7 +250,7 @@ describe("back-to-back helper runs survive an empty open on the second run", () 
 
     for (runIndex = 0; runIndex < 2; runIndex++) {
       const artifactDir = path.join(root, "proof-" + runIndex);
-      const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall: makeBrowserCall() });
+      const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall: makeBrowserCall(), receiptStatePath });
       expect(receipt).toMatchObject({ complete: true, checkedCount: 1 });
       expect(fs.existsSync(path.join(artifactDir, "receipt.json"))).toBe(true);
     }
@@ -209,6 +269,7 @@ describe("close-only-owned-tab cleanup semantics", () => {
     roots.push(root);
     const dedupePath = path.join(root, "seen.txt");
     fs.writeFileSync(dedupePath, "existing notification key\n");
+    const receiptStatePath = path.join(root, "receipt-state.json");
     let reads = 0;
     const browserCall = vi.fn((args: string[]) => {
       if (args[0] === "open") return { suggestedTargetId: "OWNED-NEW" };
@@ -216,7 +277,7 @@ describe("close-only-owned-tab cleanup semantics", () => {
       return { ok: true };
     });
     const artifactDir = path.join(root, "proof");
-    const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall });
+    const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath });
     expect(receipt).toMatchObject({ complete: true });
     const closes = browserCall.mock.calls.filter(([a]) => a[0] === "close");
     expect(closes).toHaveLength(1);
@@ -229,6 +290,7 @@ describe("close-only-owned-tab cleanup semantics", () => {
     roots.push(root);
     const dedupePath = path.join(root, "seen.txt");
     fs.writeFileSync(dedupePath, "existing notification key\n");
+    const receiptStatePath = path.join(root, "receipt-state.json");
     let reads = 0;
     const browserCall = vi.fn((args: string[]) => {
       if (args[0] === "open") return {}; // empty open -> reuse path
@@ -237,7 +299,7 @@ describe("close-only-owned-tab cleanup semantics", () => {
       return { ok: true };
     });
     const artifactDir = path.join(root, "proof");
-    const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall });
+    const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath });
     expect(receipt).toMatchObject({ complete: true });
     const closes = browserCall.mock.calls.filter(([a]) => a[0] === "close");
     // The reused pre-existing tab must never be closed.
