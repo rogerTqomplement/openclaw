@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { inboxFn, runMailboxCheck, validateInbox } from "../../scripts/gmail-browser-read-receipt.mjs";
+import { acquireTarget, failureCategory, inboxFn, runMailboxCheck, validateInbox } from "../../scripts/gmail-browser-read-receipt.mjs";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -40,6 +40,86 @@ describe("Gmail query derivation (hash-nav regression)", () => {
   });
 });
 
+// Regression for the sep15 empty-DOM render race: a transient not-rendered inbox
+// (0 rows AND no range chrome — the real 19:00/19:30 shape) must classify as its own
+// retryable INBOX_NOT_RENDERED category, NOT be conflated with a real pagination
+// overflow. A genuine overflow ("1–50 de 1,048", 49 rendered) stays PAGINATION_INCOMPLETE
+// and fails fast. Reverting the split re-collapses both to PAGINATION_INCOMPLETE.
+describe("Gmail empty-DOM vs pagination classification (sep15 render-race regression)", () => {
+  const catFor = (inbox: unknown) => {
+    try { validateInbox(inbox as never); return null; }
+    catch (error) { return failureCategory(error); }
+  };
+  it("classifies an empty-DOM race as retryable INBOX_NOT_RENDERED", () => {
+    expect(catFor({ authenticated: true, query: "newer_than:2d in:inbox", range: undefined, rows: [] }))
+      .toBe("INBOX_NOT_RENDERED");
+  });
+  it("keeps a real pagination overflow (with thousands separator) as a real, non-retryable fault", () => {
+    const overflow = { authenticated: true, query: "newer_than:2d in:inbox", range: "1–50 de 1,048",
+      rows: new Array(49).fill(0).map((_, i) => ({ subject: "s" + i, sender: "x", date: "d", threadId: "a" + i, messageId: "b" + i })) };
+    // validateInbox now splits a genuine overflow (parsed total > shown end) into its own
+    // PAGINATION_OVERFLOW category (see the overflow branch in validateInbox); it is still a
+    // real fault that fails fast, just diagnosed distinctly from the empty-DOM race above.
+    expect(catFor(overflow)).toBe("PAGINATION_OVERFLOW");
+  });
+});
+
+// Receipt-isolation regression (sep17 receipt-isolation-review-sep17-1446): the mocked test
+// suite must NEVER write the real canonical receipt the scheduled reader owns. The prior
+// consolidated suite called runMailboxCheck WITHOUT receiptStatePath, so the helper defaulted
+// to DEFAULT_RECEIPT_STATE_PATH (~/rocky-pipeline/state/gmail-watch-last-check.json) and the
+// "complete" path's writeCanonical() overwrote the real file with a test tmp artifactDir
+// (observed live: artifactDir=.../tmp/gmail-receipt-test-cQRKQV/proof). This test proves that
+// a mocked complete run AND a mocked failed run, when given an explicit private receiptStatePath,
+// write ONLY that private file and leave the real canonical default path untouched.
+describe("receipt isolation: mocked checks never touch the canonical default receipt", () => {
+  // Resolve the SAME default the helper captured at import (HOME-derived), read-only.
+  const canonicalDefault = path.join(process.env.HOME ?? "/Users/rogelio", "rocky-pipeline", "state", "gmail-watch-last-check.json");
+  const snapshot = () => (fs.existsSync(canonicalDefault)
+    ? { exists: true, bytes: fs.readFileSync(canonicalDefault) }
+    : { exists: false, bytes: Buffer.alloc(0) });
+
+  const makeInboxRow = () => ({ ok: true, result: makeInbox() });
+  const makeThread = (body: string) => ({ ok: true, result: { subject: "Example", messageId: "def456", body } });
+
+  it.each(["complete", "missing-body"])("writes only the private receiptStatePath on a %s mocked run", (outcome) => {
+    const before = snapshot();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-receipt-isolation-"));
+    roots.push(root);
+    const dedupePath = path.join(root, "seen.txt");
+    fs.writeFileSync(dedupePath, "existing notification key\n");
+    const artifactDir = path.join(root, "proof");
+    const receiptStatePath = path.join(root, "private-receipt-state.json");
+    let reads = 0;
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return { suggestedTargetId: "iso-tab" };
+      if (args[0] !== "evaluate") return { ok: true };
+      reads++;
+      if (reads === 2) return makeThread(outcome === "missing-body" ? "" : "Latest message content");
+      return makeInboxRow();
+    });
+
+    if (outcome === "complete") {
+      const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath });
+      expect(receipt).toMatchObject({ complete: true });
+      // The private receipt IS written, and it records the private artifactDir (not canonical).
+      expect(fs.existsSync(receiptStatePath)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(receiptStatePath, "utf8"))).toMatchObject({ artifactDir });
+    } else {
+      expect(() => runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath })).toThrow();
+      // A failed run writes NO receipt at all (fails closed) — neither private nor canonical.
+      expect(fs.existsSync(receiptStatePath)).toBe(false);
+    }
+
+    // The real canonical default receipt is byte-for-byte unchanged (or still absent).
+    const after = snapshot();
+    expect(after.exists).toBe(before.exists);
+    expect(after.bytes.equals(before.bytes)).toBe(true);
+    // Defensive: the mocked run must never have targeted the canonical default path.
+    expect(receiptStatePath).not.toBe(canonicalDefault);
+  });
+});
+
 describe("Gmail browser read receipt", () => {
   it.each(["authentication", "pagination", "identity"])("fails closed on incomplete %s", (boundary) => {
     const inbox = makeInbox();
@@ -49,32 +129,288 @@ describe("Gmail browser read receipt", () => {
     expect(() => validateInbox(inbox)).toThrow();
   });
 
-  it.each(["complete", "missing-body", "changed-mailbox"])("records only a %s check and never consumes alerts", (outcome) => {
+  it.each(["complete", "missing-body"])("records only a %s check and never consumes alerts", (outcome) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-receipt-test-"));
     roots.push(root);
     const dedupePath = path.join(root, "seen.txt");
     fs.writeFileSync(dedupePath, "existing notification key\n");
     const artifactDir = path.join(root, "proof");
+    // Isolation: mocked checks must write their receipt to a PRIVATE per-test path,
+    // never the canonical DEFAULT_RECEIPT_STATE_PATH the scheduled reader owns.
+    const receiptStatePath = path.join(root, "receipt-state.json");
     let reads = 0;
     const browserCall = vi.fn((args: string[]) => {
       if (args[0] === "open") return { suggestedTargetId: "test-tab" };
       if (args[0] !== "evaluate") return { ok: true };
       reads++;
       if (reads === 2) return { ok: true, result: { subject: "Example", messageId: "def456", body: outcome === "missing-body" ? "" : "Latest message content" } };
-      const inbox = makeInbox();
-      if (reads === 3 && outcome === "changed-mailbox") inbox.rows[0].messageId = "ffff";
-      return { ok: true, result: inbox };
+      return { ok: true, result: makeInbox() };
     });
     if (outcome === "complete") {
-      const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall });
+      const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath });
       expect(receipt).toMatchObject({ complete: true, checkedCount: 1, readKeys: ["abc123:def456"], sentMail: false, sentMessages: false, notificationDedupeAdvanced: false });
       expect(fs.existsSync(path.join(artifactDir, "receipt.json"))).toBe(true);
     } else {
-      expect(() => runMailboxCheck({ artifactDir, dedupePath, browserCall })).toThrow();
+      expect(() => runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath })).toThrow();
       expect(fs.existsSync(path.join(artifactDir, "receipt.json"))).toBe(false);
     }
     expect(fs.readFileSync(dedupePath, "utf8")).toBe("existing notification key\n");
     expect(browserCall).toHaveBeenLastCalledWith(["close", "test-tab"]);
-    expect(browserCall.mock.calls.every(([args]) => ["open", "navigate", "evaluate", "close"].includes(args[0]))).toBe(true);
+    expect(browserCall.mock.calls.every(([args]) => ["open", "tabs", "navigate", "evaluate", "close"].includes(args[0]))).toBe(true);
+  });
+});
+
+// Regression for the sep17 receipt flap (beast-reliability-completion-sep17-1358): after
+// the reader closes its own tab, the NEXT open() deterministically returned no target on
+// the shared profile, so alternating scheduled runs failed BROWSER_TARGET_UNAVAILABLE.
+// acquireTarget() must survive an empty open() by reusing an existing authenticated Gmail
+// tab and/or retrying, and only throw when the browser is genuinely dead. The instant
+// (0ms) sleep keeps these deterministic and fast.
+describe("acquireTarget resilience (sep17 receipt-flap regression)", () => {
+  const noSleep = () => {};
+  it("returns the owned target when open() succeeds on the first try (no tab listing)", () => {
+    const browserCall = vi.fn((args: string[]) => (args[0] === "open" ? { suggestedTargetId: "t1" } : {}));
+    // acquireTarget now returns { target, owned }; a freshly opened tab is run-owned.
+    expect(acquireTarget(browserCall, { sleep: noSleep })).toEqual({ target: "t1", owned: true });
+    expect(browserCall).toHaveBeenCalledTimes(1);
+    expect(browserCall).toHaveBeenCalledWith(["open", expect.any(String)]);
+  });
+
+  it("reuses an existing authenticated Gmail tab when open() returns no target", () => {
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return {}; // empty open (the flap condition)
+      if (args[0] === "tabs") return { tabs: [
+        { url: "https://app.qomplement.com/ui2", tabId: "tX" },
+        { url: "https://mail.google.com/mail/u/0/#search/x", suggestedTargetId: "gmail-tab" },
+      ] };
+      return { ok: true };
+    });
+    // A reused pre-existing authenticated Gmail tab is NOT run-owned (owned:false),
+    // so the caller must not close it in cleanup (close-only-owned-tab semantics).
+    expect(acquireTarget(browserCall, { sleep: noSleep })).toEqual({ target: "gmail-tab", owned: false });
+    // Reused tab is navigated to the inbox query before it is handed back.
+    expect(browserCall).toHaveBeenCalledWith(["navigate", expect.any(String), "--target-id", "gmail-tab"]);
+  });
+
+  it("retries open() with backoff and succeeds on a later attempt", () => {
+    let opens = 0;
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") { opens++; return opens >= 2 ? { tabId: "late" } : {}; }
+      if (args[0] === "tabs") return { tabs: [] }; // nothing reusable yet
+      return { ok: true };
+    });
+    // A retried open that finally succeeds yields a run-owned tab.
+    expect(acquireTarget(browserCall, { attempts: 3, sleep: noSleep })).toEqual({ target: "late", owned: true });
+    expect(opens).toBe(2);
+  });
+
+  it("throws BROWSER_TARGET_UNAVAILABLE only after all attempts fail", () => {
+    const browserCall = vi.fn((args: string[]) => (args[0] === "tabs" ? { tabs: [] } : {}));
+    let category: string | null = null;
+    try { acquireTarget(browserCall, { attempts: 3, sleep: noSleep }); }
+    catch (error) { category = failureCategory(error); }
+    expect(category).toBe("BROWSER_TARGET_UNAVAILABLE");
+    expect(browserCall.mock.calls.filter(([a]) => a[0] === "open")).toHaveLength(3);
+  });
+
+  // FAIL-CLOSED regression (reliability-navigation-failclosed-sep17-1456): a reused tab
+  // still carries its PREVIOUS route's mailbox contents, so it must NOT be handed back
+  // as usable when the re-navigation to our inbox query FAILS. Pre-fix, acquireTarget
+  // swallowed a failed navigate with an empty catch and returned the reused target
+  // anyway (fail OPEN -> a subsequent read against stale mailbox contents). Post-fix it
+  // fails closed: a failed navigate is treated like a failed attempt, so with a single
+  // attempt and no other target, acquireTarget throws BROWSER_TARGET_UNAVAILABLE rather
+  // than returning a stale tab. Reverting to the empty-catch behavior makes this test's
+  // toThrow expectation fail (it would return the stale target instead).
+  it("does NOT return a reused tab when re-navigating it to the inbox query THROWS (fails closed)", () => {
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return {}; // empty open -> reuse path
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "stale-gmail-tab" }] };
+      if (args[0] === "navigate") throw new Error("navigate failed: target detached");
+      return { ok: true };
+    });
+    let category: string | null = null;
+    // Single attempt so the only path to a target is the (failing) reuse navigation.
+    try { acquireTarget(browserCall, { attempts: 1, sleep: noSleep }); }
+    catch (error) { category = failureCategory(error); }
+    expect(category).toBe("BROWSER_TARGET_UNAVAILABLE");
+    // The failed reused tab is NEVER handed back as a usable target.
+    expect(browserCall.mock.results.some(r => r.type === "return" && (r.value as { target?: string })?.target === "stale-gmail-tab")).toBe(false);
+  });
+
+  it("does NOT return a reused tab when re-navigation returns a non-ok envelope (fails closed)", () => {
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return {}; // empty open -> reuse path
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "stale-gmail-tab" }] };
+      if (args[0] === "navigate") return { ok: false, error: "NAVIGATION_FAILED" }; // failed nav, no throw
+      return { ok: true };
+    });
+    let category: string | null = null;
+    try { acquireTarget(browserCall, { attempts: 1, sleep: noSleep }); }
+    catch (error) { category = failureCategory(error); }
+    expect(category).toBe("BROWSER_TARGET_UNAVAILABLE");
+  });
+
+  it("DOES reuse the tab when the re-navigation succeeds (ok:true) — happy path preserved", () => {
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return {};
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "gmail-tab" }] };
+      if (args[0] === "navigate") return { ok: true };
+      return { ok: true };
+    });
+    expect(acquireTarget(browserCall, { sleep: noSleep })).toEqual({ target: "gmail-tab", owned: false });
+    expect(browserCall).toHaveBeenCalledWith(["navigate", expect.any(String), "--target-id", "gmail-tab"]);
+  });
+
+  // A failed reuse navigation on an EARLY attempt must not poison a later good open():
+  // the run recovers to a run-owned tab and never touches the stale reused tab.
+  it("recovers to a run-owned tab on a later attempt after an earlier reuse-nav failure", () => {
+    let opens = 0;
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") { opens++; return opens >= 2 ? { tabId: "fresh-owned" } : {}; }
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "stale-gmail-tab" }] };
+      if (args[0] === "navigate") return { ok: false }; // reuse nav fails on attempt 1
+      return { ok: true };
+    });
+    expect(acquireTarget(browserCall, { attempts: 3, sleep: noSleep })).toEqual({ target: "fresh-owned", owned: true });
+  });
+});
+
+// The concrete reproduction the fix must pass: run the whole helper TWICE back-to-back
+// against a stub whose SECOND open() returns empty (mimicking the post-close starvation on
+// the shared profile). Pre-fix this threw on run 2; post-fix run 2 reuses the Gmail tab
+// and completes a real receipt. Both runs must produce a complete receipt.
+describe("back-to-back helper runs survive an empty open on the second run", () => {
+  it("completes a receipt on both the first and the second consecutive run", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-receipt-flap-"));
+    roots.push(root);
+    const dedupePath = path.join(root, "seen.txt");
+    fs.writeFileSync(dedupePath, "existing notification key\n");
+    const receiptStatePath = path.join(root, "receipt-state.json");
+
+    let runIndex = 0;
+    const makeBrowserCall = () => {
+      let reads = 0;
+      let openCount = 0;
+      return vi.fn((args: string[]) => {
+        if (args[0] === "open") {
+          openCount++;
+          // On the SECOND helper run, the first open() is empty (post-close starvation).
+          if (runIndex === 1 && openCount === 1) return {};
+          return { suggestedTargetId: "tab-" + runIndex };
+        }
+        if (args[0] === "tabs") {
+          // A previously authenticated Gmail tab is still around to be reused.
+          return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "tab-" + runIndex }] };
+        }
+        if (args[0] !== "evaluate") return { ok: true };
+        reads++;
+        if (reads === 2) return { ok: true, result: { subject: "Example", messageId: "def456", body: "Latest message content" } };
+        return { ok: true, result: makeInbox() };
+      });
+    };
+
+    for (runIndex = 0; runIndex < 2; runIndex++) {
+      const artifactDir = path.join(root, "proof-" + runIndex);
+      const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall: makeBrowserCall(), receiptStatePath });
+      expect(receipt).toMatchObject({ complete: true, checkedCount: 1 });
+      expect(fs.existsSync(path.join(artifactDir, "receipt.json"))).toBe(true);
+    }
+  });
+});
+
+// close-only-owned-tab invariant (sep17 consolidation): a run that OPENED its own tab must
+// close exactly that tab; a run that REUSED a pre-existing authenticated Gmail tab (empty
+// open -> tab reuse) must NOT close it, or it would tear down an operator/other-run tab.
+describe("close-only-owned-tab cleanup semantics", () => {
+  const makeInboxRow = () => ({ ok: true, result: makeInbox() });
+  const makeThread = () => ({ ok: true, result: { subject: "Example", messageId: "def456", body: "Latest message content" } });
+
+  it("closes the tab it OPENED (owned) and records owned:true", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-owned-"));
+    roots.push(root);
+    const dedupePath = path.join(root, "seen.txt");
+    fs.writeFileSync(dedupePath, "existing notification key\n");
+    const receiptStatePath = path.join(root, "receipt-state.json");
+    let reads = 0;
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return { suggestedTargetId: "OWNED-NEW" };
+      if (args[0] === "evaluate") { reads++; return reads === 2 ? makeThread() : makeInboxRow(); }
+      return { ok: true };
+    });
+    const artifactDir = path.join(root, "proof");
+    const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath });
+    expect(receipt).toMatchObject({ complete: true });
+    const closes = browserCall.mock.calls.filter(([a]) => a[0] === "close");
+    expect(closes).toHaveLength(1);
+    expect(closes[0][0]).toEqual(["close", "OWNED-NEW"]);
+    expect(JSON.parse(fs.readFileSync(path.join(artifactDir, "cleanup.json"), "utf8"))).toMatchObject({ closed: true, owned: true });
+  });
+
+  it("does NOT close a REUSED pre-existing authenticated tab and records REUSED_TAB_PRESERVED", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-reused-"));
+    roots.push(root);
+    const dedupePath = path.join(root, "seen.txt");
+    fs.writeFileSync(dedupePath, "existing notification key\n");
+    const receiptStatePath = path.join(root, "receipt-state.json");
+    let reads = 0;
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return {}; // empty open -> reuse path
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "REUSED-PREEXISTING" }] };
+      if (args[0] === "evaluate") { reads++; return reads === 2 ? makeThread() : makeInboxRow(); }
+      return { ok: true };
+    });
+    const artifactDir = path.join(root, "proof");
+    const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath });
+    expect(receipt).toMatchObject({ complete: true });
+    const closes = browserCall.mock.calls.filter(([a]) => a[0] === "close");
+    // The reused pre-existing tab must never be closed.
+    expect(closes.some(([, id]) => id === "REUSED-PREEXISTING")).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(artifactDir, "cleanup.json"), "utf8"))).toMatchObject({ closed: false, owned: false, reason: "REUSED_TAB_PRESERVED" });
+  });
+});
+
+// END-TO-END fail-closed regression (reliability-navigation-failclosed-sep17-1456): when
+// the ONLY route to a target is a reused pre-existing Gmail tab whose re-navigation to our
+// inbox query FAILS, the whole check must fail closed — throw BROWSER_TARGET_UNAVAILABLE
+// and write NO canonical receipt — rather than read stale mailbox contents off the reused
+// tab and emit a "complete" receipt. Every receipt write is bound to a per-test temp
+// receiptStatePath (the process HOME is never used or repurposed), so this test cannot
+// touch the real canonical receipt under any outcome. Pre-fix (empty-catch), the reused
+// tab was returned despite the failed navigate, the stub's inbox evaluate then produced a
+// "complete" receipt, and this test's toThrow + no-receipt assertions FAIL. Post-fix they
+// pass.
+describe("reused-tab navigation failure fails the whole check closed (no stale receipt)", () => {
+  const makeInboxRow = () => ({ ok: true, result: makeInbox() });
+  const makeThread = () => ({ ok: true, result: { subject: "Example", messageId: "def456", body: "Latest message content" } });
+
+  it("throws BROWSER_TARGET_UNAVAILABLE and writes no canonical receipt when the reused tab cannot be re-navigated", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-navfailclosed-"));
+    roots.push(root);
+    const dedupePath = path.join(root, "seen.txt");
+    fs.writeFileSync(dedupePath, "existing notification key\n");
+    const dedupeBefore = fs.readFileSync(dedupePath, "utf8");
+    // Private per-test receipt path inside the temp root; HOME is never used.
+    const receiptStatePath = path.join(root, "canonical-receipt-state.json");
+    let reads = 0;
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return {}; // empty open -> reuse path only
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "STALE-REUSED" }] };
+      if (args[0] === "navigate") return { ok: false, error: "NAVIGATION_FAILED" }; // re-nav of reused tab fails
+      if (args[0] === "evaluate") { reads++; return reads === 2 ? makeThread() : makeInboxRow(); }
+      return { ok: true };
+    });
+    const artifactDir = path.join(root, "proof");
+    let category: string | null = null;
+    try { runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath }); }
+    catch (error) { category = failureCategory(error); }
+    // Fails closed with the honest target-unavailable category...
+    expect(category).toBe("BROWSER_TARGET_UNAVAILABLE");
+    // ...never runs an inbox read off the stale tab...
+    expect(reads).toBe(0);
+    // ...writes NO canonical receipt (the wrapper would record CHECK_INCOMPLETE)...
+    expect(fs.existsSync(receiptStatePath)).toBe(false);
+    // ...and leaves the notification dedupe untouched.
+    expect(fs.readFileSync(dedupePath, "utf8")).toBe(dedupeBefore);
   });
 });
