@@ -30,7 +30,12 @@ const TARGET_ACQUIRE_ATTEMPTS = Number(process.env.GMAIL_TARGET_ACQUIRE_ATTEMPTS
 const TARGET_ACQUIRE_BACKOFF_MS = Number(process.env.GMAIL_TARGET_ACQUIRE_BACKOFF_MS) >= 0 ? Number(process.env.GMAIL_TARGET_ACQUIRE_BACKOFF_MS) : 500;
 const inboxUrl = "https://mail.google.com/mail/u/0/#search/" + encodeURIComponent(query);
 const sleepSync = (ms) => { if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
-// A tab is a reusable Gmail target if it is an authenticated mail.google.com page.
+// A tab is a CANDIDATE reusable Gmail target when its URL is under mail.google.com.
+// Note: a mail.google.com URL prefix is NOT proof of an authenticated mailbox (a
+// logged-out/interstitial page shares the same origin). Authentication is asserted
+// separately by validateInbox (inbox.authenticated) after the read, and the reused tab
+// is only accepted once navigateOk re-points it at our inbox query; a stale/unauth tab
+// therefore cannot silently produce a "complete" receipt.
 const isGmailTab = (tab) => typeof tab?.url === "string" && tab.url.startsWith("https://mail.google.com/");
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const writePrivate = (file, value) => fs.writeFileSync(file, JSON.stringify(value, null, 2) + "\n", { mode: 0o600, flag: "wx" });
@@ -185,6 +190,18 @@ function browser(args) {
   return JSON.parse(output);
 }
 
+// A browser subcommand (navigate/close/…) is only "ok" when it neither throws nor
+// returns a non-ok envelope. The reader's evaluate path already treats `ok !== true`
+// as failure; navigate/close share that `{ ok }` envelope, so mirror the same check
+// here. Returns true only on a definite success; any throw or falsy/absent `ok` is
+// treated as a failed navigation (fail closed).
+function navigateOk(browserCall, target) {
+  let response;
+  try { response = browserCall(["navigate", inboxUrl, "--target-id", target]); }
+  catch { return false; }
+  return response?.ok === true;
+}
+
 // Acquire a stable browser target for the inbox URL, resilient to a transient empty
 // open(). Root cause of the receipt flap: after the reader's own close(), the next
 // open() sometimes returns no suggestedTargetId/tabId; throwing on the first empty open
@@ -208,9 +225,17 @@ export function acquireTarget(browserCall, { attempts = TARGET_ACQUIRE_ATTEMPTS,
     const reusable = Array.isArray(listed?.tabs) ? listed.tabs.find(isGmailTab) : null;
     const reuseTarget = reusable?.suggestedTargetId ?? reusable?.tabId;
     if (reuseTarget) {
-      // Point the reused tab at our inbox query so the subsequent read sees the right list.
-      try { browserCall(["navigate", inboxUrl, "--target-id", reuseTarget]); } catch {}
-      return { target: reuseTarget, owned: false };
+      // Point the reused tab at our inbox query so the subsequent read sees the right
+      // list. FAIL CLOSED: a reused tab still carries its PREVIOUS route's mailbox
+      // contents, so it is usable only once we have positively re-pointed it at our
+      // inbox query. The prior code swallowed a failed navigate with an empty catch and
+      // returned the reused target anyway, so a failed navigation would read STALE
+      // mailbox contents from the reused tab and could still write a "complete" receipt.
+      // Now: only hand back the reused target when the navigate DEFINITELY succeeded;
+      // otherwise fall through to retry/backoff, and if every attempt fails, throw
+      // "stable browser target unavailable" (BROWSER_TARGET_UNAVAILABLE ⇒ the wrapper's
+      // honest CHECK_INCOMPLETE gate) rather than reading a stale tab.
+      if (navigateOk(browserCall, reuseTarget)) return { target: reuseTarget, owned: false };
     }
     if (attempt < Math.max(1, attempts) - 1) sleep(backoffMs);
   }

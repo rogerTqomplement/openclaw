@@ -212,6 +212,68 @@ describe("acquireTarget resilience (sep17 receipt-flap regression)", () => {
     expect(category).toBe("BROWSER_TARGET_UNAVAILABLE");
     expect(browserCall.mock.calls.filter(([a]) => a[0] === "open")).toHaveLength(3);
   });
+
+  // FAIL-CLOSED regression (reliability-navigation-failclosed-sep17-1456): a reused tab
+  // still carries its PREVIOUS route's mailbox contents, so it must NOT be handed back
+  // as usable when the re-navigation to our inbox query FAILS. Pre-fix, acquireTarget
+  // swallowed a failed navigate with an empty catch and returned the reused target
+  // anyway (fail OPEN -> a subsequent read against stale mailbox contents). Post-fix it
+  // fails closed: a failed navigate is treated like a failed attempt, so with a single
+  // attempt and no other target, acquireTarget throws BROWSER_TARGET_UNAVAILABLE rather
+  // than returning a stale tab. Reverting to the empty-catch behavior makes this test's
+  // toThrow expectation fail (it would return the stale target instead).
+  it("does NOT return a reused tab when re-navigating it to the inbox query THROWS (fails closed)", () => {
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return {}; // empty open -> reuse path
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "stale-gmail-tab" }] };
+      if (args[0] === "navigate") throw new Error("navigate failed: target detached");
+      return { ok: true };
+    });
+    let category: string | null = null;
+    // Single attempt so the only path to a target is the (failing) reuse navigation.
+    try { acquireTarget(browserCall, { attempts: 1, sleep: noSleep }); }
+    catch (error) { category = failureCategory(error); }
+    expect(category).toBe("BROWSER_TARGET_UNAVAILABLE");
+    // The failed reused tab is NEVER handed back as a usable target.
+    expect(browserCall.mock.results.some(r => r.type === "return" && (r.value as { target?: string })?.target === "stale-gmail-tab")).toBe(false);
+  });
+
+  it("does NOT return a reused tab when re-navigation returns a non-ok envelope (fails closed)", () => {
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return {}; // empty open -> reuse path
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "stale-gmail-tab" }] };
+      if (args[0] === "navigate") return { ok: false, error: "NAVIGATION_FAILED" }; // failed nav, no throw
+      return { ok: true };
+    });
+    let category: string | null = null;
+    try { acquireTarget(browserCall, { attempts: 1, sleep: noSleep }); }
+    catch (error) { category = failureCategory(error); }
+    expect(category).toBe("BROWSER_TARGET_UNAVAILABLE");
+  });
+
+  it("DOES reuse the tab when the re-navigation succeeds (ok:true) — happy path preserved", () => {
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return {};
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "gmail-tab" }] };
+      if (args[0] === "navigate") return { ok: true };
+      return { ok: true };
+    });
+    expect(acquireTarget(browserCall, { sleep: noSleep })).toEqual({ target: "gmail-tab", owned: false });
+    expect(browserCall).toHaveBeenCalledWith(["navigate", expect.any(String), "--target-id", "gmail-tab"]);
+  });
+
+  // A failed reuse navigation on an EARLY attempt must not poison a later good open():
+  // the run recovers to a run-owned tab and never touches the stale reused tab.
+  it("recovers to a run-owned tab on a later attempt after an earlier reuse-nav failure", () => {
+    let opens = 0;
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") { opens++; return opens >= 2 ? { tabId: "fresh-owned" } : {}; }
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "stale-gmail-tab" }] };
+      if (args[0] === "navigate") return { ok: false }; // reuse nav fails on attempt 1
+      return { ok: true };
+    });
+    expect(acquireTarget(browserCall, { attempts: 3, sleep: noSleep })).toEqual({ target: "fresh-owned", owned: true });
+  });
 });
 
 // The concrete reproduction the fix must pass: run the whole helper TWICE back-to-back
@@ -305,5 +367,50 @@ describe("close-only-owned-tab cleanup semantics", () => {
     // The reused pre-existing tab must never be closed.
     expect(closes.some(([, id]) => id === "REUSED-PREEXISTING")).toBe(false);
     expect(JSON.parse(fs.readFileSync(path.join(artifactDir, "cleanup.json"), "utf8"))).toMatchObject({ closed: false, owned: false, reason: "REUSED_TAB_PRESERVED" });
+  });
+});
+
+// END-TO-END fail-closed regression (reliability-navigation-failclosed-sep17-1456): when
+// the ONLY route to a target is a reused pre-existing Gmail tab whose re-navigation to our
+// inbox query FAILS, the whole check must fail closed — throw BROWSER_TARGET_UNAVAILABLE
+// and write NO canonical receipt — rather than read stale mailbox contents off the reused
+// tab and emit a "complete" receipt. Every receipt write is bound to a per-test temp
+// receiptStatePath (the process HOME is never used or repurposed), so this test cannot
+// touch the real canonical receipt under any outcome. Pre-fix (empty-catch), the reused
+// tab was returned despite the failed navigate, the stub's inbox evaluate then produced a
+// "complete" receipt, and this test's toThrow + no-receipt assertions FAIL. Post-fix they
+// pass.
+describe("reused-tab navigation failure fails the whole check closed (no stale receipt)", () => {
+  const makeInboxRow = () => ({ ok: true, result: makeInbox() });
+  const makeThread = () => ({ ok: true, result: { subject: "Example", messageId: "def456", body: "Latest message content" } });
+
+  it("throws BROWSER_TARGET_UNAVAILABLE and writes no canonical receipt when the reused tab cannot be re-navigated", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-navfailclosed-"));
+    roots.push(root);
+    const dedupePath = path.join(root, "seen.txt");
+    fs.writeFileSync(dedupePath, "existing notification key\n");
+    const dedupeBefore = fs.readFileSync(dedupePath, "utf8");
+    // Private per-test receipt path inside the temp root; HOME is never used.
+    const receiptStatePath = path.join(root, "canonical-receipt-state.json");
+    let reads = 0;
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return {}; // empty open -> reuse path only
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "STALE-REUSED" }] };
+      if (args[0] === "navigate") return { ok: false, error: "NAVIGATION_FAILED" }; // re-nav of reused tab fails
+      if (args[0] === "evaluate") { reads++; return reads === 2 ? makeThread() : makeInboxRow(); }
+      return { ok: true };
+    });
+    const artifactDir = path.join(root, "proof");
+    let category: string | null = null;
+    try { runMailboxCheck({ artifactDir, dedupePath, browserCall, receiptStatePath }); }
+    catch (error) { category = failureCategory(error); }
+    // Fails closed with the honest target-unavailable category...
+    expect(category).toBe("BROWSER_TARGET_UNAVAILABLE");
+    // ...never runs an inbox read off the stale tab...
+    expect(reads).toBe(0);
+    // ...writes NO canonical receipt (the wrapper would record CHECK_INCOMPLETE)...
+    expect(fs.existsSync(receiptStatePath)).toBe(false);
+    // ...and leaves the notification dedupe untouched.
+    expect(fs.readFileSync(dedupePath, "utf8")).toBe(dedupeBefore);
   });
 });
