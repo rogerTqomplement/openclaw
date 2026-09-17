@@ -197,7 +197,11 @@ export function acquireTarget(browserCall, { attempts = TARGET_ACQUIRE_ATTEMPTS,
   for (let attempt = 0; attempt < Math.max(1, attempts); attempt++) {
     const opened = browserCall(["open", inboxUrl]);
     const target = opened?.suggestedTargetId ?? opened?.tabId;
-    if (target) return target;
+    // owned=true: this run opened the tab, so its end-of-run close is safe. owned=false:
+    // we reused a pre-existing authenticated Gmail tab we did NOT open, and MUST NOT close
+    // it in the finally (close-only-owned-tab semantics) or we would tear down an
+    // operator/other-run tab. Return the ownership flag so the caller can gate cleanup.
+    if (target) return { target, owned: true };
     // Empty open: try to reuse an existing authenticated Gmail tab before retrying.
     let listed;
     try { listed = browserCall(["tabs"]); } catch { listed = null; }
@@ -206,7 +210,7 @@ export function acquireTarget(browserCall, { attempts = TARGET_ACQUIRE_ATTEMPTS,
     if (reuseTarget) {
       // Point the reused tab at our inbox query so the subsequent read sees the right list.
       try { browserCall(["navigate", inboxUrl, "--target-id", reuseTarget]); } catch {}
-      return reuseTarget;
+      return { target: reuseTarget, owned: false };
     }
     if (attempt < Math.max(1, attempts) - 1) sleep(backoffMs);
   }
@@ -217,7 +221,7 @@ export function runMailboxCheck({ artifactDir, dedupePath, browserCall = browser
   fs.mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
   const startedAt = new Date().toISOString();
   const beforeDedupe = fs.readFileSync(dedupePath);
-  const target = acquireTarget(browserCall);
+  const { target, owned: targetOwned } = acquireTarget(browserCall);
   const startedMs = Date.now();
   const evaluate = (fn) => {
     const response = browserCall(["evaluate", "--target-id", target, "--fn", fn]);
@@ -369,16 +373,24 @@ export function runMailboxCheck({ artifactDir, dedupePath, browserCall = browser
   } finally {
     // Cleanup is not a second mailbox read. Preserve the original read failure,
     // or a completed receipt, while recording cleanup separately without raw errors.
+    // Close-only-owned-tab semantics: close ONLY a tab this run opened. When
+    // acquireTarget reused a pre-existing authenticated Gmail tab (targetOwned=false),
+    // closing it would tear down an operator/other-run tab, so we skip the close and
+    // record it as a preserved (not-owned) tab.
     let cleanup;
-    try {
-      browserCall(["close", target]);
-      cleanup = { closed: true };
-    } catch (error) {
-      cleanup = { closed: false, reason: failureCategory(error) };
+    if (!targetOwned) {
+      cleanup = { closed: false, reason: "REUSED_TAB_PRESERVED", owned: false };
+    } else {
+      try {
+        browserCall(["close", target]);
+        cleanup = { closed: true, owned: true };
+      } catch (error) {
+        cleanup = { closed: false, reason: failureCategory(error), owned: true };
+      }
     }
     try { writePrivate(path.join(artifactDir, "cleanup.json"), cleanup); }
     catch { process.stderr.write("GMAIL_CLEANUP_WARNING: evidence write failed\n"); }
-    if (!cleanup.closed) process.stderr.write(`GMAIL_CLEANUP_WARNING: ${cleanup.reason}\n`);
+    if (!cleanup.closed && cleanup.reason !== "REUSED_TAB_PRESERVED") process.stderr.write(`GMAIL_CLEANUP_WARNING: ${cleanup.reason}\n`);
   }
 }
 

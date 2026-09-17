@@ -109,9 +109,10 @@ describe("Gmail browser read receipt", () => {
 // (0ms) sleep keeps these deterministic and fast.
 describe("acquireTarget resilience (sep17 receipt-flap regression)", () => {
   const noSleep = () => {};
-  it("returns the target when open() succeeds on the first try (no tab listing)", () => {
+  it("returns the owned target when open() succeeds on the first try (no tab listing)", () => {
     const browserCall = vi.fn((args: string[]) => (args[0] === "open" ? { suggestedTargetId: "t1" } : {}));
-    expect(acquireTarget(browserCall, { sleep: noSleep })).toBe("t1");
+    // acquireTarget now returns { target, owned }; a freshly opened tab is run-owned.
+    expect(acquireTarget(browserCall, { sleep: noSleep })).toEqual({ target: "t1", owned: true });
     expect(browserCall).toHaveBeenCalledTimes(1);
     expect(browserCall).toHaveBeenCalledWith(["open", expect.any(String)]);
   });
@@ -125,7 +126,9 @@ describe("acquireTarget resilience (sep17 receipt-flap regression)", () => {
       ] };
       return { ok: true };
     });
-    expect(acquireTarget(browserCall, { sleep: noSleep })).toBe("gmail-tab");
+    // A reused pre-existing authenticated Gmail tab is NOT run-owned (owned:false),
+    // so the caller must not close it in cleanup (close-only-owned-tab semantics).
+    expect(acquireTarget(browserCall, { sleep: noSleep })).toEqual({ target: "gmail-tab", owned: false });
     // Reused tab is navigated to the inbox query before it is handed back.
     expect(browserCall).toHaveBeenCalledWith(["navigate", expect.any(String), "--target-id", "gmail-tab"]);
   });
@@ -137,7 +140,8 @@ describe("acquireTarget resilience (sep17 receipt-flap regression)", () => {
       if (args[0] === "tabs") return { tabs: [] }; // nothing reusable yet
       return { ok: true };
     });
-    expect(acquireTarget(browserCall, { attempts: 3, sleep: noSleep })).toBe("late");
+    // A retried open that finally succeeds yields a run-owned tab.
+    expect(acquireTarget(browserCall, { attempts: 3, sleep: noSleep })).toEqual({ target: "late", owned: true });
     expect(opens).toBe(2);
   });
 
@@ -190,5 +194,54 @@ describe("back-to-back helper runs survive an empty open on the second run", () 
       expect(receipt).toMatchObject({ complete: true, checkedCount: 1 });
       expect(fs.existsSync(path.join(artifactDir, "receipt.json"))).toBe(true);
     }
+  });
+});
+
+// close-only-owned-tab invariant (sep17 consolidation): a run that OPENED its own tab must
+// close exactly that tab; a run that REUSED a pre-existing authenticated Gmail tab (empty
+// open -> tab reuse) must NOT close it, or it would tear down an operator/other-run tab.
+describe("close-only-owned-tab cleanup semantics", () => {
+  const makeInboxRow = () => ({ ok: true, result: makeInbox() });
+  const makeThread = () => ({ ok: true, result: { subject: "Example", messageId: "def456", body: "Latest message content" } });
+
+  it("closes the tab it OPENED (owned) and records owned:true", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-owned-"));
+    roots.push(root);
+    const dedupePath = path.join(root, "seen.txt");
+    fs.writeFileSync(dedupePath, "existing notification key\n");
+    let reads = 0;
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return { suggestedTargetId: "OWNED-NEW" };
+      if (args[0] === "evaluate") { reads++; return reads === 2 ? makeThread() : makeInboxRow(); }
+      return { ok: true };
+    });
+    const artifactDir = path.join(root, "proof");
+    const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall });
+    expect(receipt).toMatchObject({ complete: true });
+    const closes = browserCall.mock.calls.filter(([a]) => a[0] === "close");
+    expect(closes).toHaveLength(1);
+    expect(closes[0][0]).toEqual(["close", "OWNED-NEW"]);
+    expect(JSON.parse(fs.readFileSync(path.join(artifactDir, "cleanup.json"), "utf8"))).toMatchObject({ closed: true, owned: true });
+  });
+
+  it("does NOT close a REUSED pre-existing authenticated tab and records REUSED_TAB_PRESERVED", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gmail-reused-"));
+    roots.push(root);
+    const dedupePath = path.join(root, "seen.txt");
+    fs.writeFileSync(dedupePath, "existing notification key\n");
+    let reads = 0;
+    const browserCall = vi.fn((args: string[]) => {
+      if (args[0] === "open") return {}; // empty open -> reuse path
+      if (args[0] === "tabs") return { tabs: [{ url: "https://mail.google.com/mail/u/0/#inbox", suggestedTargetId: "REUSED-PREEXISTING" }] };
+      if (args[0] === "evaluate") { reads++; return reads === 2 ? makeThread() : makeInboxRow(); }
+      return { ok: true };
+    });
+    const artifactDir = path.join(root, "proof");
+    const receipt = runMailboxCheck({ artifactDir, dedupePath, browserCall });
+    expect(receipt).toMatchObject({ complete: true });
+    const closes = browserCall.mock.calls.filter(([a]) => a[0] === "close");
+    // The reused pre-existing tab must never be closed.
+    expect(closes.some(([, id]) => id === "REUSED-PREEXISTING")).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(artifactDir, "cleanup.json"), "utf8"))).toMatchObject({ closed: false, owned: false, reason: "REUSED_TAB_PRESERVED" });
   });
 });
