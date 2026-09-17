@@ -14,7 +14,24 @@ const query = "newer_than:2d in:inbox";
 // margin; override with GMAIL_READ_BUDGET_MS. The per-browser-call timeout (25s) is
 // unchanged, so a genuinely hung browser still fails fast per call.
 const READ_BUDGET_MS = Number(process.env.GMAIL_READ_BUDGET_MS) > 0 ? Number(process.env.GMAIL_READ_BUDGET_MS) : 240_000;
+// Dedicated browser profile for the reader. The reader closes its own tab at the end of
+// each run (see finally); on the SHARED default profile that close deterministically left
+// the very next scheduled open() with no reusable target, so alternating runs failed
+// BROWSER_TARGET_UNAVAILABLE (the every-:00-fail / every-:30-ok 60-min-effective flap).
+// Isolating the reader onto its own profile means its own close cannot starve its next
+// start. Default is UNSET so behavior/authentication is unchanged until an operator opts
+// in via GMAIL_BROWSER_PROFILE (mirrors the cua1..cua4 worker-isolation convention).
+const BROWSER_PROFILE = (process.env.GMAIL_BROWSER_PROFILE || "").trim();
+// Bounded retry budget for acquiring a stable browser target on an empty open(): a
+// transient empty open is retried a few times (re-listing existing tabs to reuse an
+// already-authenticated Gmail tab) before declaring BROWSER_TARGET_UNAVAILABLE. Kept
+// small so a genuinely dead browser still fails fast within the per-run budget.
+const TARGET_ACQUIRE_ATTEMPTS = Number(process.env.GMAIL_TARGET_ACQUIRE_ATTEMPTS) > 0 ? Number(process.env.GMAIL_TARGET_ACQUIRE_ATTEMPTS) : 3;
+const TARGET_ACQUIRE_BACKOFF_MS = Number(process.env.GMAIL_TARGET_ACQUIRE_BACKOFF_MS) >= 0 ? Number(process.env.GMAIL_TARGET_ACQUIRE_BACKOFF_MS) : 500;
 const inboxUrl = "https://mail.google.com/mail/u/0/#search/" + encodeURIComponent(query);
+const sleepSync = (ms) => { if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+// A tab is a reusable Gmail target if it is an authenticated mail.google.com page.
+const isGmailTab = (tab) => typeof tab?.url === "string" && tab.url.startsWith("https://mail.google.com/");
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const writePrivate = (file, value) => fs.writeFileSync(file, JSON.stringify(value, null, 2) + "\n", { mode: 0o600, flag: "wx" });
 // Canonical receipt is OVERWRITTEN each successful check (not wx): the runtime
@@ -161,17 +178,46 @@ export const inboxFn = `async () => {
 }`;
 
 function browser(args) {
-  const output = execFileSync("openclaw", ["browser", ...args, "--json"], { encoding: "utf8", timeout: 25_000, maxBuffer: 2_000_000, stdio: ["ignore", "pipe", "pipe"] });
+  // Thread the dedicated reader profile onto every browser subcommand when configured, so
+  // open/evaluate/navigate/close/tabs all target the same isolated profile.
+  const profileArgs = BROWSER_PROFILE ? ["--browser-profile", BROWSER_PROFILE] : [];
+  const output = execFileSync("openclaw", ["browser", ...profileArgs, ...args, "--json"], { encoding: "utf8", timeout: 25_000, maxBuffer: 2_000_000, stdio: ["ignore", "pipe", "pipe"] });
   return JSON.parse(output);
+}
+
+// Acquire a stable browser target for the inbox URL, resilient to a transient empty
+// open(). Root cause of the receipt flap: after the reader's own close(), the next
+// open() sometimes returns no suggestedTargetId/tabId; throwing on the first empty open
+// discarded an otherwise-healthy run. Instead: (1) try open(); (2) on an empty result,
+// re-list tabs and reuse an existing authenticated Gmail tab (navigating it to the inbox
+// URL); (3) retry open() a few times with short backoff. Only after all attempts fail do
+// we surface BROWSER_TARGET_UNAVAILABLE — so a genuinely dead browser still fails hard
+// and the wrapper's honest CHECK_INCOMPLETE gate is preserved.
+export function acquireTarget(browserCall, { attempts = TARGET_ACQUIRE_ATTEMPTS, backoffMs = TARGET_ACQUIRE_BACKOFF_MS, sleep = sleepSync } = {}) {
+  for (let attempt = 0; attempt < Math.max(1, attempts); attempt++) {
+    const opened = browserCall(["open", inboxUrl]);
+    const target = opened?.suggestedTargetId ?? opened?.tabId;
+    if (target) return target;
+    // Empty open: try to reuse an existing authenticated Gmail tab before retrying.
+    let listed;
+    try { listed = browserCall(["tabs"]); } catch { listed = null; }
+    const reusable = Array.isArray(listed?.tabs) ? listed.tabs.find(isGmailTab) : null;
+    const reuseTarget = reusable?.suggestedTargetId ?? reusable?.tabId;
+    if (reuseTarget) {
+      // Point the reused tab at our inbox query so the subsequent read sees the right list.
+      try { browserCall(["navigate", inboxUrl, "--target-id", reuseTarget]); } catch {}
+      return reuseTarget;
+    }
+    if (attempt < Math.max(1, attempts) - 1) sleep(backoffMs);
+  }
+  throw new Error("stable browser target unavailable");
 }
 
 export function runMailboxCheck({ artifactDir, dedupePath, browserCall = browser, receiptStatePath = DEFAULT_RECEIPT_STATE_PATH }) {
   fs.mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
   const startedAt = new Date().toISOString();
   const beforeDedupe = fs.readFileSync(dedupePath);
-  const opened = browserCall(["open", inboxUrl]);
-  const target = opened.suggestedTargetId ?? opened.tabId;
-  if (!target) throw new Error("stable browser target unavailable");
+  const target = acquireTarget(browserCall);
   const startedMs = Date.now();
   const evaluate = (fn) => {
     const response = browserCall(["evaluate", "--target-id", target, "--fn", fn]);
