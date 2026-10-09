@@ -300,7 +300,12 @@ export function buildInboxFn(expectedStart = 1) {
     range: rangeText(),
     rows: Array.from(document.querySelectorAll("tr.zA")).filter(visible).map(row => {
       const identity = row.querySelector("[data-legacy-thread-id]");
+      // Gmail marks an UNREAD list row with class "zE" (read rows carry "yO"). Capture it
+      // so receipts can answer "what is still unread"; read:true on an entry only means
+      // the helper read the body, never Gmail's own unread state. (No backticks here: this
+      // code lives inside a template literal.)
       return {
+        unread: row.classList.contains("zE"),
         subject: row.querySelector(".bog")?.innerText.trim(),
         sender: row.querySelector(".yW")?.innerText.trim(),
         senderAddress: row.querySelector(".yW [email]")?.getAttribute("email"),
