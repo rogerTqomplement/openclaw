@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { inboxFn, runMailboxCheck, validateInbox } from "../../scripts/gmail-browser-read-receipt.mjs";
+import { failureCategory, inboxFn, runMailboxCheck, validateInbox } from "../../scripts/gmail-browser-read-receipt.mjs";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -37,6 +37,27 @@ describe("Gmail query derivation (hash-nav regression)", () => {
   it("still prefers a populated search box", async () => {
     const inbox = await runInboxFn("newer_than:2d in:inbox ", "#search/other");
     expect(inbox.query.trim()).toBe(query);
+  });
+});
+
+// Regression for the sep15 empty-DOM render race: a transient not-rendered inbox
+// (0 rows AND no range chrome — the real 19:00/19:30 shape) must classify as its own
+// retryable INBOX_NOT_RENDERED category, NOT be conflated with a real pagination
+// overflow. A genuine overflow ("1–50 de 1,048", 49 rendered) stays PAGINATION_INCOMPLETE
+// and fails fast. Reverting the split re-collapses both to PAGINATION_INCOMPLETE.
+describe("Gmail empty-DOM vs pagination classification (sep15 render-race regression)", () => {
+  const catFor = (inbox: unknown) => {
+    try { validateInbox(inbox as never); return null; }
+    catch (error) { return failureCategory(error); }
+  };
+  it("classifies an empty-DOM race as retryable INBOX_NOT_RENDERED", () => {
+    expect(catFor({ authenticated: true, query: "newer_than:2d in:inbox", range: undefined, rows: [] }))
+      .toBe("INBOX_NOT_RENDERED");
+  });
+  it("keeps a real pagination overflow (with thousands separator) as PAGINATION_INCOMPLETE", () => {
+    const overflow = { authenticated: true, query: "newer_than:2d in:inbox", range: "1–50 de 1,048",
+      rows: new Array(49).fill(0).map((_, i) => ({ subject: "s" + i, sender: "x", date: "d", threadId: "a" + i, messageId: "b" + i })) };
+    expect(catFor(overflow)).toBe("PAGINATION_INCOMPLETE");
   });
 });
 
